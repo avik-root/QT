@@ -234,17 +234,6 @@ configTime(YOUR_OFFSET_IN_SECONDS, 0, "pool.ntp.org");
 
 ---
 
-## Project Files
-
-```
-Embedded System/
-├── oled_display_server.ino   # QT Robot firmware
-├── blink_uno.ino             # Basic WiFi AP test firmware
-└── README.md                 # Project documentation
-```
-
----
-
 ## License
 
 This project is licensed under the **MIT License** — free to use, modify, and distribute.
