@@ -1,6 +1,6 @@
 <div align="center">
   
-[![QT Robot](https://readme-typing-svg.demolab.com?font=Fira+Code&weight=500&size=24&pause=1000&color=FF00FF&color2=00FFF7&color3=00FF00&color4=FFA500&color5=FF0000&center=true&vCenter=true&width=480&lines=QT+Robot+V1.0)]()
+[![QT Robot](https://readme-typing-svg.demolab.com?font=Fira+Code&weight=500&size=24&pause=1000&color=FF00FF&color2=00FFF7&color3=00FF00&color4=FFA500&color5=FF0000&center=true&vCenter=true&width=480&lines=QT+Robot+V3.0+Beta)]()
 ## Developed and build by [Avik Samanta](https://github.com/avik-root) and [Anusha Gupta](https://github.com/anushagupta11) | MintFire
 ---
 ### Smart OLED Display Server for ESP32-C3
