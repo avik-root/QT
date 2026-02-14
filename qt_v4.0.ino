@@ -17,7 +17,7 @@
 #define SCL_PIN 7
 #define LED_PIN 8
 #define TOUCH_PIN 3      // TTP223 touch sensor
-#define BUZZER_PIN 10    // Passive buzzer (GPIO nb2 is USB strapping pin — do NOT use)
+#define BUZZER_PIN 5     // Passive buzzer (GPIO 2=USB, GPIO 10=SPI flash — avoid both!)
 #define DHT_PIN 4        // DHT11 data pin
 #define DHT_TYPE DHT11
 
@@ -28,7 +28,7 @@ DHT dht(DHT_PIN, DHT_TYPE);
 
 // ==================== AP CONFIG ====================
 const char* ap_ssid = "QT-Robot";
-const char* ap_password = "qt@mintfire";
+const char* ap_password = "12345678";
 
 // ==================== WIFI STA ====================
 String sta_ssid = "";
@@ -47,6 +47,9 @@ bool weatherValid = false;
 
 // ==================== TIME ====================
 bool timeSynced = false;
+unsigned long lastNtpAttempt = 0;
+const unsigned long ntpRetryInterval = 10000; // retry NTP every 10 seconds until synced
+bool ntpConfigured = false; // tracks if configTime() was called
 
 // ==================== TEXT BANNER ====================
 String bannerText = "Hello World!";
@@ -86,6 +89,10 @@ bool alarmActive = false;         // true when alarm is currently firing
 unsigned long lastBuzzerToggle = 0;
 bool buzzerState = false;
 const unsigned long buzzerInterval = 500; // 500ms on/off
+// Buzzer preview (test from web)
+bool buzzerPreview = false;
+unsigned long buzzerPreviewStart = 0;
+const unsigned long buzzerPreviewDuration = 2000; // 2 second preview
 
 // ==================== ANIMATION STATE ====================
 int scrollX = SCREEN_WIDTH;
@@ -102,7 +109,7 @@ unsigned long lastHacker = 0;
 
 // ==================== WIFI RECONNECT ====================
 unsigned long lastWifiCheck = 0;
-const unsigned long wifiCheckInterval = 30000;
+const unsigned long wifiCheckInterval = 15000; // check every 15s for faster AP recovery
 
 // ==================== HTML HELPERS ====================
 String pageHead(String title, int active) {
@@ -156,17 +163,41 @@ String pageFoot() { return "</div></body></html>"; }
 // ==================== WIFI ====================
 void startAP() {
   Serial.println("[AP-DEBUG] startAP() called");
+  Serial.println("[AP-DEBUG] Disconnecting any existing WiFi...");
+  WiFi.disconnect(true);
+  delay(100);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
-  delay(200);
+  delay(300);
   WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),IPAddress(255,255,255,0));
-  Serial.println("[AP-DEBUG] Starting softAP: SSID=" + String(ap_ssid) + " CH=1");
-  bool apOk = WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
-  Serial.println("[AP-DEBUG] softAP() returned: " + String(apOk ? "SUCCESS" : "FAILED"));
-  delay(1000);
-  Serial.println("[AP-DEBUG] AP IP: " + WiFi.softAPIP().toString());
+  delay(100);
+
+  // Try up to 3 times to start the AP
+  bool apOk = false;
+  for(int attempt=1; attempt<=3; attempt++) {
+    Serial.println("[AP-DEBUG] softAP attempt " + String(attempt) + ": SSID=" + String(ap_ssid) + " CH=1");
+    apOk = WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
+    delay(1500); // give AP time to stabilize
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.println("[AP-DEBUG] softAP() returned: " + String(apOk ? "SUCCESS" : "FAILED"));
+    Serial.println("[AP-DEBUG] AP IP: " + apIP.toString());
+    if(apOk && apIP != IPAddress(0,0,0,0)) {
+      Serial.println("[AP-DEBUG] AP verified OK on attempt " + String(attempt));
+      break;
+    }
+    Serial.println("[AP-DEBUG] AP not ready, retrying...");
+    WiFi.softAPdisconnect(true);
+    delay(500);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    delay(300);
+    WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),IPAddress(255,255,255,0));
+    delay(100);
+  }
   Serial.println("[AP-DEBUG] AP MAC: " + WiFi.softAPmacAddress());
+  Serial.println("[AP-DEBUG] AP Mode: " + String(WiFi.getMode()) + " (3=AP_STA)");
+  Serial.println("[AP-DEBUG] AP final IP: " + WiFi.softAPIP().toString());
 }
 
 void connectSTA() {
@@ -184,18 +215,46 @@ void connectSTA() {
     display.setCursor(10,45);display.print(String(20-tries)+"s  ");
     display.display();
   }
-  // Re-enable AP after STA connection attempt
+  // Restore AP mode and re-enable AP
+  Serial.println("[AP-DEBUG] Ensuring AP_STA mode after WiFi.begin...");
   WiFi.enableAP(true);
-  WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
+  delay(100);
+  bool apOk = WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
   delay(500);
+  Serial.println("[AP-DEBUG] AP re-enabled: " + String(apOk ? "OK" : "FAILED") + " IP: " + WiFi.softAPIP().toString());
+  // If AP failed, force restart it
+  if(!apOk || WiFi.softAPIP() == IPAddress(0,0,0,0)) {
+    Serial.println("[AP-DEBUG] AP lost during STA connect, forcing restart...");
+    WiFi.softAPdisconnect(true);
+    delay(300);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    delay(200);
+    WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),IPAddress(255,255,255,0));
+    WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
+    delay(1000);
+    Serial.println("[AP-DEBUG] AP force-restarted: " + WiFi.softAPIP().toString());
+  }
   if(WiFi.status()==WL_CONNECTED){
     staConnected=true;
     Serial.println("[STA] Connected: "+WiFi.localIP().toString());
     Serial.println("[AP-DEBUG] AP IP: " + WiFi.softAPIP().toString());
+    // Configure NTP servers
     configTime(19800,0,"pool.ntp.org","time.nist.gov");
-    delay(2000);
+    ntpConfigured=true;
+    Serial.println("[NTP] configTime called, waiting for sync...");
+    // Try multiple times with short delays
     struct tm t;
-    if(getLocalTime(&t,5000)){timeSynced=true;Serial.println("[NTP] Synced");}
+    for(int attempt=0;attempt<5;attempt++){
+      delay(1500);
+      if(getLocalTime(&t,3000)){
+        timeSynced=true;
+        Serial.println("[NTP] Synced on attempt " + String(attempt+1));
+        break;
+      }
+      Serial.println("[NTP] Attempt " + String(attempt+1) + " failed, retrying...");
+    }
+    if(!timeSynced) Serial.println("[NTP] Initial sync failed — will retry in loop");
     display.clearDisplay();
     display.setCursor(10,15);display.print("WiFi Connected!");
     display.setCursor(10,30);display.print("IP: "+WiFi.localIP().toString());
@@ -248,10 +307,17 @@ void checkWifiReconnect() {
     if(WiFi.status()==WL_CONNECTED){
       staConnected=true;
       Serial.println("[STA] Reconnected: "+WiFi.localIP().toString());
-      if(!timeSynced){
+      if(!ntpConfigured){
         configTime(19800,0,"pool.ntp.org","time.nist.gov");
+        ntpConfigured=true;
+        Serial.println("[NTP] configTime called after reconnect");
+      }
+      if(!timeSynced){
         struct tm t;
-        if(getLocalTime(&t,3000)) timeSynced=true;
+        if(getLocalTime(&t,5000)){
+          timeSynced=true;
+          Serial.println("[NTP] Synced after reconnect");
+        }
       }
     }
   }
@@ -299,7 +365,30 @@ void fetchWeather() {
   lastWeatherFetch=millis();
 }
 
-// ==================== DHT11 ====================
+// ==================== NTP SYNC RETRY ====================
+void checkNTPSync() {
+  if(timeSynced) return;
+  if(WiFi.status()!=WL_CONNECTED) return;
+  if(millis()-lastNtpAttempt < ntpRetryInterval) return;
+  lastNtpAttempt=millis();
+  if(!ntpConfigured){
+    configTime(19800,0,"pool.ntp.org","time.nist.gov");
+    ntpConfigured=true;
+    Serial.println("[NTP] configTime called from retry loop");
+    return; // give it time to start
+  }
+  struct tm t;
+  if(getLocalTime(&t,3000)){
+    timeSynced=true;
+    Serial.println("[NTP] Synced via retry loop!");
+    char buf[30]; strftime(buf,sizeof(buf),"%Y-%m-%d %H:%M:%S",&t);
+    Serial.println("[NTP] Time: " + String(buf));
+  } else {
+    Serial.println("[NTP] Retry failed, will try again in 10s");
+  }
+}
+
+// ==================== DHT11 ======================================
 void readDHT() {
   if(millis()-lastDhtRead<2000) return;
   lastDhtRead=millis();
@@ -326,6 +415,23 @@ void checkAlarm() {
 }
 
 void handleBuzzer() {
+  // Handle preview mode (auto-stop after duration)
+  if(buzzerPreview) {
+    if(millis()-buzzerPreviewStart >= buzzerPreviewDuration) {
+      buzzerPreview=false;
+      buzzerState=false;
+      digitalWrite(BUZZER_PIN, LOW);
+      Serial.println("[BUZZER] Preview ended");
+      return;
+    }
+    if(millis()-lastBuzzerToggle >= buzzerInterval){
+      lastBuzzerToggle=millis();
+      buzzerState=!buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    }
+    return;
+  }
+  // Handle alarm mode
   if(!alarmActive) {
     digitalWrite(BUZZER_PIN, LOW);
     return;
@@ -757,9 +863,25 @@ void handleDispSave() {
 // ==================== WEB: ALARM ====================
 void handleAlarm() {
   String h=pageHead("Alarm",4);
+  // Time sync status card
+  h+="<div class='card'><h2>Clock Status</h2><div class='row'>";
+  if(timeSynced){
+    struct tm t; getLocalTime(&t);
+    char nowBuf[9]; int hr=t.tm_hour%12; if(hr==0)hr=12;
+    sprintf(nowBuf,"%d:%02d %s",hr,t.tm_min,t.tm_hour>=12?"PM":"AM");
+    h+="<div class='box'><div class='lbl'>Time</div><div class='val'>"+String(nowBuf)+"</div></div>"
+      "<div class='box'><div class='lbl'>Status</div><div class='val'><span class='tag tg'>Synced</span></div></div>";
+  } else {
+    h+="<div class='box'><div class='lbl'>Status</div><div class='val'><span class='tag tr'>Not Synced</span></div></div>"
+      "<div class='box'><div class='lbl'>Action</div><div class='val' style='font-size:11px'>Connect WiFi first</div></div>";
+  }
+  h+="</div></div>";
+
+  // Alarm settings
   h+="<div class='card'><h2>Alarm Settings</h2>"
-    "<p class='sub'>Set up to 3 alarms. Double-tap touch sensor to dismiss.</p>"
-    "<form action='/alarm-save' method='POST'>";
+    "<p class='sub'>Set up to 3 alarms. Double-tap touch sensor to dismiss.</p>";
+  if(!timeSynced) h+="<p style='color:#f85149;font-size:12px;margin-bottom:10px'>&#9888; Connect WiFi to sync time before alarms can fire.</p>";
+  h+="<form action='/alarm-save' method='POST'>";
   for(int i=0;i<MAX_ALARMS;i++){
     char timeVal[6];
     sprintf(timeVal,"%02d:%02d",alarms[i].hour,alarms[i].minute);
@@ -773,9 +895,17 @@ void handleAlarm() {
       "<span class='sl'></span></label></div>";
   }
   h+="<button class='btn' type='submit'>Save Alarms</button></form></div>";
-  // Current alarm status
+
+  // Buzzer test card
+  h+="<div class='card'><h2>Buzzer Test</h2>"
+    "<p class='sub'>Preview the alarm buzzer sound (2 second beep).</p>"
+    "<button class='btn btn-blue' id='playBtn' onclick='testBuzzer()'>&#9654; Play Buzzer Preview</button>"
+    "<p id='playMsg' style='color:#3fb950;font-size:12px;margin-top:8px;display:none'>Buzzer playing...</p>"
+    "</div>";
+
+  // Status card
   h+="<div class='card'><h2>Status</h2>"
-    "<div class='row'><div class='box'><div class='lbl'>State</div><div class='val'>"
+    "<div class='row'><div class='box'><div class='lbl'>Alarm</div><div class='val'>"
     +String(alarmActive?"<span class='tag tr'>RINGING</span>":"<span class='tag tg'>Standby</span>")
     +"</div></div></div>";
   // List active alarms
@@ -792,16 +922,39 @@ void handleAlarm() {
     }
   }
   h+="</div></div>";
+
   // Instructions
   h+="<div class='card'><h2>How It Works</h2>"
     "<div style='font-size:13px;color:#8b949e;line-height:1.8'>"
-    "<p><span style='color:#58a6ff'>1.</span> Set time and enable the alarm</p>"
-    "<p><span style='color:#58a6ff'>2.</span> When alarm fires, buzzer beeps and display shows time</p>"
-    "<p><span style='color:#58a6ff'>3.</span> Double-tap touch sensor to dismiss</p>"
-    "<p><span style='color:#58a6ff'>4.</span> Single-tap touch sensor to switch screens normally</p>"
+    "<p><span style='color:#58a6ff'>1.</span> Connect WiFi to sync the clock</p>"
+    "<p><span style='color:#58a6ff'>2.</span> Set time and enable the alarm</p>"
+    "<p><span style='color:#58a6ff'>3.</span> When alarm fires, buzzer beeps and display shows time</p>"
+    "<p><span style='color:#58a6ff'>4.</span> Double-tap touch sensor to dismiss</p>"
+    "<p><span style='color:#58a6ff'>5.</span> Single-tap touch sensor to switch screens normally</p>"
     "</div></div>";
+
+  // JavaScript for buzzer test
+  h+="<script>function testBuzzer(){"
+    "var b=document.getElementById('playBtn');"
+    "var m=document.getElementById('playMsg');"
+    "b.disabled=true;b.style.opacity='0.5';b.innerHTML='Playing...';"
+    "m.style.display='block';"
+    "fetch('/buzzer-test').then(r=>r.text()).then(d=>{"
+    "setTimeout(function(){b.disabled=false;b.style.opacity='1';b.innerHTML='&#9654; Play Buzzer Preview';m.style.display='none';},2500);"
+    "});"
+    "}</script>";
+
   h+=pageFoot();
   server.send(200,"text/html",h);
+}
+
+void handleBuzzerTest() {
+  buzzerPreview=true;
+  buzzerPreviewStart=millis();
+  lastBuzzerToggle=millis();
+  buzzerState=false;
+  Serial.println("[BUZZER] Preview started from web");
+  server.send(200,"text/plain","OK");
 }
 
 void handleAlarmSave() {
@@ -824,11 +977,11 @@ void handleAlarmSave() {
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200); delay(1000);
-  Serial.println("\n=== QT Robot v4.0 - Multi-Display Server ===");
+  Serial.println("\n=== QT Robot v5.0 - Multi-Display Server ===");
   Serial.println("Developed by Avik & Anusha | MintFire");
   pinMode(LED_PIN,OUTPUT);digitalWrite(LED_PIN,HIGH);
   pinMode(TOUCH_PIN,INPUT);
-  pinMode(BUZZER_PIN,OUTPUT);digitalWrite(BUZZER_PIN,LOW);
+  // NOTE: Buzzer pin init moved AFTER WiFi init to prevent radio interference
 
   // OLED
   Wire.begin(SDA_PIN,SCL_PIN);
@@ -839,7 +992,7 @@ void setup() {
   display.setTextSize(2);display.setTextColor(SSD1306_WHITE);
   display.setCursor(20,5);display.println("QT Robot");
   display.setTextSize(1);
-  display.setCursor(30,28);display.println("v4.0");
+  display.setCursor(30,28);display.println("v5.0");
   display.setCursor(15,40);display.println("Developed by");
   display.setCursor(8,50);display.println("Avik and Anusha");
   display.display();delay(2500);
@@ -873,6 +1026,11 @@ void setup() {
   for(int i=0;i<22;i++) rainDrops[i]=random(0,64);
 
   startAP();
+
+  // Init buzzer AFTER WiFi — avoids GPIO conflicts during radio startup
+  pinMode(BUZZER_PIN,OUTPUT);digitalWrite(BUZZER_PIN,LOW);
+  Serial.println("[HW] Buzzer on GPIO " + String(BUZZER_PIN) + " initialized");
+
   if(sta_ssid.length()>0) connectSTA();
 
   server.on("/",handleHome);
@@ -886,6 +1044,7 @@ void setup() {
   server.on("/disp-save",HTTP_POST,handleDispSave);
   server.on("/alarm",handleAlarm);
   server.on("/alarm-save",HTTP_POST,handleAlarmSave);
+  server.on("/buzzer-test",handleBuzzerTest);
   server.begin();
 
   Serial.println("Server: http://"+WiFi.softAPIP().toString());
@@ -896,6 +1055,7 @@ void setup() {
 void loop() {
   server.handleClient();
   checkWifiReconnect();
+  checkNTPSync();
   handleTouch();
   readDHT();
   checkAlarm();
